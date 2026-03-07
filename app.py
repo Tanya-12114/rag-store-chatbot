@@ -9,7 +9,7 @@ import numpy as np
 
 print("Current working directory:", os.getcwd())
 
-# Define the path to JSON data
+# Define the path to the JSON data
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 json_path = os.path.join(BASE_DIR, 'data.json')
 
