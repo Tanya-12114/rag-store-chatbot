@@ -1,0 +1,60 @@
+{
+  "products": [
+    {
+      "id": 1,
+      "name": "Laptop Pro X",
+      "category": "Electronics",
+      "price": 999.99,
+      "description": "High-performance laptop with 16GB RAM and 512GB SSD",
+      "stock": 50
+    },
+    {
+      "id": 2,
+      "name": "Smartphone Y",
+      "category": "Electronics",
+      "price": 699.99,
+      "description": "5G smartphone with advanced camera system",
+      "stock": 100
+    },
+    {
+      "id": 3,
+      "name": "Wireless Headphones",
+      "category": "Electronics",
+      "price": 199.99,
+      "description": "Noise-cancelling wireless headphones with 20 hours of battery life",
+      "stock": 150
+    }
+  ],
+  "orders": [
+    {
+      "id": 1,
+      "customer_name": "John Doe",
+      "date": "2025-03-11",
+      "total": 999.99,
+      "status": "Shipped"
+    },
+    {
+      "id": 2,
+      "customer_name": "Jane Doe",
+      "date": "2025-03-12",
+      "total": 699.99,
+      "status": "Pending"
+    }
+  ],
+  "customers": [
+    {
+      "id": 1,
+      "name": "John Doe",
+      "email": "john.doe@example.com",
+      "join_date": "2024-01-15",
+      "total_orders": 5
+    },
+    {
+      "id": 2,
+      "name": "Jane Doe",
+      "email": "jane.doe@example.com",
+      "join_date": "2024-03-22",
+      "total_orders": 3
+    }
+  ]
+}
