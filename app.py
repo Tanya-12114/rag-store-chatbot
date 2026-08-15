@@ -1,146 +1,165 @@
 import os
-os.environ['TRANSFORMERS_OFFLINE'] = '1'
-os.environ['HF_DATASETS_OFFLINE'] = '1'
 
-import streamlit as st
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+
 import json
 import traceback
-import numpy as np
+
+import streamlit as st
+
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 print("Current working directory:", os.getcwd())
 
-# Define the path to the JSON data
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-json_path = os.path.join(BASE_DIR, 'data.json')
+JSON_PATH = os.path.join(BASE_DIR, "data.json")
 
-with open(json_path, 'r') as f:
-    data = json.load(f)
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL_NAME = os.environ.get("GOOGLE_MODEL", "gemini-3.6-flash")
+# Upper bound on retrieved chunks. The actual k used is min(this, total
+# documents), so on a small catalog like this one every record is always
+# retrieved and "list all products/orders/customers" style questions get
+# complete context instead of an arbitrary top-3 similarity slice.
+MAX_RETRIEVER_K = 20
 
-print("Data loaded successfully")
+SYSTEM_PROMPT = (
+    "You are a helpful assistant for an online store. Answer the user's "
+    "question using ONLY the information in the context below. Be concise "
+    "and specific (e.g. include exact prices, stock counts, statuses, or "
+    "emails when asked). If the answer is not contained in the context, "
+    "say you don't have that information — do not make anything up.\n\n"
+    "Context:\n{context}"
+)
 
 
-class SimpleRAGChat:
+class LangChainRAGChat:
+    """RAG pipeline built on LangChain: FAISS vector store for retrieval,
+    a HuggingFace sentence-transformer for embeddings, and an LLM
+    (via a retrieval chain) for actually generating the answer from the
+    retrieved context."""
+
     def __init__(self, json_path):
-        with open(json_path, 'r') as f:
+        with open(json_path, "r") as f:
             self.data = json.load(f)
-        self.documents = []
         self.embedding_model = None
-        self.index = None
+        self.vectorstore = None
+        self.retrieval_chain = None
 
-    def init_models(self):
-        print("Loading SentenceTransformer...")
-        from sentence_transformers import SentenceTransformer
-        self.embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-        print("SentenceTransformer loaded OK")
+    def _build_documents(self):
+        """Turn each record into a LangChain Document with useful metadata,
+        instead of an opaque formatted string. This lets the retriever and
+        any future tool/agent logic reason about record type and id."""
+        documents = []
 
-    def create_document_store(self):
-        import faiss
+        for product in self.data.get("products", []):
+            content = (
+                f"Product {product['id']}: {product['name']} - "
+                f"{product['description']} - Category: {product['category']} - "
+                f"Price: ${product['price']} - Stock: {product['stock']}"
+            )
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={"type": "product", "id": product["id"], "name": product["name"]},
+                )
+            )
 
-        self.documents = []
+        for order in self.data.get("orders", []):
+            content = (
+                f"Order {order['id']}: Customer {order['customer_name']} "
+                f"ordered on {order['date']} - Total: ${order['total']} - "
+                f"Status: {order['status']}"
+            )
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={"type": "order", "id": order["id"], "customer": order["customer_name"]},
+                )
+            )
 
-        for product in self.data.get('products', []):
-            doc = f"Product {product['id']}: {product['name']} - {product['description']} - Category: {product['category']} - Price: ${product['price']} - Stock: {product['stock']}"
-            self.documents.append(doc)
+        for customer in self.data.get("customers", []):
+            content = (
+                f"Customer {customer['id']}: {customer['name']} - "
+                f"Email: {customer['email']} - Joined: {customer['join_date']} - "
+                f"Total Orders: {customer['total_orders']}"
+            )
+            documents.append(
+                Document(
+                    page_content=content,
+                    metadata={"type": "customer", "id": customer["id"], "name": customer["name"]},
+                )
+            )
 
-        orders = self.data.get('orders', [])
-        if orders:
-            for order in orders:
-                doc = f"Order {order['id']}: Customer {order['customer_name']} ordered on {order['date']} - Total: ${order['total']} - Status: {order['status']}"
-                self.documents.append(doc)
-
-        for customer in self.data.get('customers', []):
-            doc = f"Customer {customer['id']}: {customer['name']} - Email: {customer['email']} - Joined: {customer['join_date']} - Total Orders: {customer['total_orders']}"
-            self.documents.append(doc)
-
-        print(f"Documents created: {len(self.documents)}")
-
-        embeddings = self.embedding_model.encode(self.documents)
-        self.dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(self.dimension)
-        self.index.add(np.array(embeddings))
-        print(f"FAISS index has {self.index.ntotal} documents")
+        return documents
 
     def setup(self):
-        self.init_models()
-        self.create_document_store()
+        print("Loading HuggingFace embedding model...")
+        self.embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        print("Embedding model loaded OK")
 
-    def retrieve_relevant_docs(self, query, k=3):
-        query_embedding = self.embedding_model.encode([query])
-        _, indices = self.index.search(np.array(query_embedding), k)
-        return [self.documents[i] for i in indices[0]]
+        documents = self._build_documents()
+        print(f"Documents created: {len(documents)}")
+
+        print("Building FAISS vector store...")
+        self.vectorstore = FAISS.from_documents(documents, self.embedding_model)
+        print(f"FAISS index has {self.vectorstore.index.ntotal} documents")
+
+        retriever_k = min(MAX_RETRIEVER_K, len(documents))
+        print(f"Retriever k = {retriever_k}")
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": retriever_k})
+
+        if not os.environ.get("GOOGLE_API_KEY"):
+            raise RuntimeError(
+                "GOOGLE_API_KEY is not set. Get a free key at "
+                "https://aistudio.google.com/apikey and export it before "
+                "running the app, e.g. `export GOOGLE_API_KEY=...` (see README)."
+            )
+
+        llm = ChatGoogleGenerativeAI(model=LLM_MODEL_NAME, temperature=0)
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", SYSTEM_PROMPT),
+                ("human", "{input}"),
+            ]
+        )
+
+        combine_docs_chain = create_stuff_documents_chain(llm, prompt)
+        self.retrieval_chain = create_retrieval_chain(retriever, combine_docs_chain)
 
     def answer_query(self, query):
-        relevant_docs = self.retrieve_relevant_docs(query)
-        answer = self._build_answer(query, relevant_docs)
-        return answer, relevant_docs
-
-    def _build_answer(self, query, docs):
-        query_lower = query.lower()
-
-        for doc in docs:
-            doc_lower = doc.lower()
-
-            # Price queries
-            if any(word in query_lower for word in ['price', 'cost', 'how much']):
-                if 'price:' in doc_lower:
-                    parts = doc.split('Price: $')
-                    if len(parts) > 1:
-                        price = parts[1].split(' ')[0].split('-')[0].strip()
-                        name = doc.split(':')[1].split('-')[0].strip()
-                        return f"The price of {name} is ${price}."
-
-            # Stock queries
-            if any(word in query_lower for word in ['stock', 'available', 'inventory', 'many']):
-                if 'stock:' in doc_lower:
-                    parts = doc.split('Stock: ')
-                    if len(parts) > 1:
-                        stock = parts[1].strip()
-                        name = doc.split(':')[1].split('-')[0].strip()
-                        return f"{name} has {stock} units in stock."
-
-            # Status queries
-            if any(word in query_lower for word in ['status', 'shipped', 'pending', 'order']):
-                if 'status:' in doc_lower:
-                    parts = doc.split('Status: ')
-                    if len(parts) > 1:
-                        status = parts[1].strip()
-                        order_id = doc.split(':')[0].replace('Order', '').strip()
-                        return f"Order {order_id} status is: {status}."
-
-            # Email queries
-            if any(word in query_lower for word in ['email', 'contact', 'mail']):
-                if 'email:' in doc_lower:
-                    parts = doc.split('Email: ')
-                    if len(parts) > 1:
-                        email = parts[1].split(' ')[0].split('-')[0].strip()
-                        name = doc.split(':')[1].split('-')[0].strip()
-                        return f"{name}'s email is {email}."
-
-        # Default: return most relevant document
-        if docs:
-            return f"Based on our store data: {docs[0]}"
-        return "I couldn't find relevant information for your query."
+        result = self.retrieval_chain.invoke({"input": query})
+        answer = result["answer"]
+        sources = [doc.page_content for doc in result.get("context", [])]
+        return answer, sources
 
 
 def main():
     st.title("💬 Store Data Assistant")
     st.caption("Ask questions about products, orders, and customers")
 
-    if 'messages' not in st.session_state:
+    if "messages" not in st.session_state:
         st.session_state.messages = []
-    if 'rag_chat' not in st.session_state:
+    if "rag_chat" not in st.session_state:
         st.session_state.rag_chat = None
-    if 'load_error' not in st.session_state:
+    if "load_error" not in st.session_state:
         st.session_state.load_error = None
 
     if st.session_state.rag_chat is None and st.session_state.load_error is None:
         with st.spinner("Loading models... This might take a minute..."):
             try:
-                rag = SimpleRAGChat(json_path)
+                rag = LangChainRAGChat(JSON_PATH)
                 rag.setup()
                 st.session_state.rag_chat = rag
                 print("RAG chat initialized successfully")
-            except Exception as e:
+            except Exception:
                 error_msg = traceback.format_exc()
                 st.session_state.load_error = error_msg
                 print(f"FATAL ERROR: {error_msg}")
@@ -175,11 +194,9 @@ def main():
                 try:
                     answer, sources = st.session_state.rag_chat.answer_query(prompt)
                     st.write(answer)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "sources": sources
-                    })
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": answer, "sources": sources}
+                    )
                 except Exception as e:
                     st.error(f"Error: {e}")
                     traceback.print_exc()
